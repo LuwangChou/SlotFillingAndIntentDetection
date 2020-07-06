@@ -407,3 +407,6 @@ def prepareEmbeddingsMatrix(embedding_path,in_vocab,embedding_size):
     sigma = np.std(embedding_matrix,axis=0)
     return (embedding_matrix - mu) / sigma
 
+#    _range = np.max(embedding_matrix) - np.min(embedding_matrix)
+#    return (embedding_matrix - np.min(embedding_matrix)) / _range
+    
