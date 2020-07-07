@@ -30,7 +30,7 @@ parser.add_argument("--model_type", type=str, default='full', help="""full(defau
                                                                     none: not using any attention""")
 parser.add_argument("--use_crf", type=bool, default=False, help="""use crf for seq labeling""")
 parser.add_argument("--use_embedding", type=str, default='1', help="""use pre-trained embedding""")
-parser.add_argument("--cell", type=str, default='rnn', help="""rnn cell""")  
+parser.add_argument("--cell", type=str, default='gru', help="""rnn cell""")  
 
 # Training Environment
 parser.add_argument("--batch_size", type=int, default=16, help="Batch size.")
@@ -59,6 +59,7 @@ parser.add_argument("--input_file", type=str, default='seq.in', help="Input file
 parser.add_argument("--slot_file", type=str, default='seq.out', help="Slot file name.")
 parser.add_argument("--intent_file", type=str, default='label', help="Intent file name.")
 parser.add_argument("--embedding_path", type=str, default='', help=" ./wordembedding/ embedding array's path.")
+parser.add_argument("--repeat_num", type=int, default=5, help=" repeat experiment number.")
 
 arg = parser.parse_args()
 '''
@@ -349,171 +350,190 @@ saver = tf.train.Saver()
 gpu_options=tf.GPUOptions(per_process_gpu_memory_fraction=0.2)
 config = tf.ConfigProto(log_device_placement=True,allow_soft_placement=True,gpu_options=gpu_options)
 config.gpu_options.allow_growth = True
+repeat_num = arg.repeat_num
+cell_type = arg.cell
 # Start Training
-with tf.Session(config=config) as sess:
-    sess.run(tf.global_variables_initializer()) 
-    logging.info('Training Start') 
-
-    epochs = 0
-    loss = 0.0
-    data_processor = None
-    line = 0
-    num_loss = 0
-    step = 0
-    no_improve = 0
-
-    # variables to store highest values among epochs, only use 'valid_err' for now
-    valid_slot = 0
-    test_slot = 0
-    valid_intent = 0
-    test_intent = 0
-    valid_err = 0  
-    test_err = 0
-    best_epoch_num = 0
-    slot_f1_mean = 0
-    intent_accuracy_mean = 0
-    semantic_accuracy_mean = 0
-    epoch_sum = 0
-    while True:
-        if data_processor == None:
-            data_processor = DataProcessor(os.path.join(full_train_path, arg.input_file),
-                                           os.path.join(full_train_path, arg.slot_file),
-                                           os.path.join(full_train_path, arg.intent_file), in_vocab, slot_vocab,
-                                           intent_vocab)
-        in_data, slot_data, slot_weight, length, intents, _, _, _ = data_processor.get_batch(arg.batch_size)
-        feed_dict = {input_data.name: in_data, slots.name: slot_data, slot_weights.name: slot_weight,
-                     sequence_length.name: length, intent.name: intents}
-        ret = sess.run(training_outputs, feed_dict)
-        loss += np.mean(ret[1])
-
-        line += arg.batch_size
-        step = ret[0]
-        num_loss += 1
-
-        if data_processor.end == 1:
-            arg.batch_size += arg.batch_size_add 
-            line = 0
-            data_processor.close() 
-            data_processor = None
-            epochs += 1 
-            epoch_sum = epochs
-            logging.info('Step: ' + str(step))
-            logging.info('Epochs: ' + str(epochs))
-            logging.info('Loss: ' + str(loss / num_loss))
-            num_loss = 0
-            loss = 0.0
-
-            save_path = os.path.join(arg.model_path, '_step_' + str(step) + '_epochs_' + str(epochs) + '.ckpt')
-            saver.save(sess, save_path)
-
-
-            def valid(in_path, slot_path, intent_path):
-                data_processor_valid = DataProcessor(in_path, slot_path, intent_path, in_vocab, slot_vocab,
-                                                     intent_vocab)
-
-                pred_intents = []
-                correct_intents = []
-                slot_outputs = []
-                correct_slots = []
-                input_words = []
-
-                # used to gate
-                gate_seq = []
-                while True:
-                    in_data, slot_data, slot_weight, length, intents, in_seq, slot_seq, intent_seq = data_processor_valid.get_batch(
-                        arg.batch_size)
-                    if len(in_data) <= 0:
-                        break
-                    feed_dict = {input_data.name: in_data, sequence_length.name: length}
-                    ret = sess.run(inference_outputs, feed_dict)
-                    for i in ret[0]:  
-                        pred_intents.append(np.argmax(i))
-                    for i in intents:
-                        correct_intents.append(i)
-
-                    pred_slots = ret[1].reshape((slot_data.shape[0], slot_data.shape[1], -1))
-                    for p, t, i, l in zip(pred_slots, slot_data, in_data, length):
-                        if arg.use_crf:
-                            p = p.reshape([-1])
-                        else:
-                            p = np.argmax(p, 1)
-                        tmp_pred = []
-                        tmp_correct = []
-                        tmp_input = []
-                        for j in range(l):
-                            tmp_pred.append(slot_vocab['rev'][p[j]])
-                            tmp_correct.append(slot_vocab['rev'][t[j]])
-                            tmp_input.append(in_vocab['rev'][i[j]])
-
-                        slot_outputs.append(tmp_pred)  
-                        correct_slots.append(tmp_correct)
-                        input_words.append(tmp_input)
-
-                    if data_processor_valid.end == 1:
-                        break
-
-                pred_intents = np.array(pred_intents)
-                correct_intents = np.array(correct_intents)
-                accuracy = (pred_intents == correct_intents)
-                semantic_acc = accuracy
-                accuracy = accuracy.astype(float)
-                accuracy = np.mean(accuracy) * 100.0  
-
-                index = 0
-                for t, p in zip(correct_slots, slot_outputs):
-                    # Process Semantic Error
-                    if len(t) != len(p):
-                        raise ValueError('Error!!')
-
-                    for j in range(len(t)):
-                        if p[j] != t[j]:
-                            semantic_acc[index] = False
+for num in range(0,repeat_num):
+    with tf.Session(config=config) as sess:
+        sess.run(tf.global_variables_initializer()) 
+        logging.info('Training Start') 
+        filename = '/result_'+str(cell_type)+'.txt'
+        file_handle = open(full_test_path+filename, 'w')
+        file_handle.write("epoch"+","+"f1"+","+"accuracy"+","+"semantic_accuracy"+'\n') # 写列名
+        #series = str(epochs)+","+str(epoch_test_slot)+","+str(epoch_test_intent)+","+str(epoch_test_err)  # 每个元素都是字符串，使用逗号分割拼接成一个字符串
+        #file_handle.write(series+'\n') # 末尾使用换行分割每一行。
+        file_handle.close()
+        epochs = 0
+        loss = 0.0
+        data_processor = None
+        line = 0
+        num_loss = 0
+        step = 0
+        no_improve = 0
+    
+        # variables to store highest values among epochs, only use 'valid_err' for now
+        valid_slot = 0
+        test_slot = 0
+        valid_intent = 0
+        test_intent = 0
+        valid_err = 0  
+        test_err = 0
+        best_epoch_num = 0
+        slot_f1_mean = 0
+        intent_accuracy_mean = 0
+        semantic_accuracy_mean = 0
+        epoch_sum = 0
+        while True:
+            if data_processor == None:
+                data_processor = DataProcessor(os.path.join(full_train_path, arg.input_file),
+                                               os.path.join(full_train_path, arg.slot_file),
+                                               os.path.join(full_train_path, arg.intent_file), in_vocab, slot_vocab,
+                                               intent_vocab)
+            in_data, slot_data, slot_weight, length, intents, _, _, _ = data_processor.get_batch(arg.batch_size)
+            feed_dict = {input_data.name: in_data, slots.name: slot_data, slot_weights.name: slot_weight,
+                         sequence_length.name: length, intent.name: intents}
+            ret = sess.run(training_outputs, feed_dict)
+            loss += np.mean(ret[1])
+    
+            line += arg.batch_size
+            step = ret[0]
+            num_loss += 1
+            #f1_result_array = []
+            #acc_result_array = []
+            #semantic_acc_array = []
+            if data_processor.end == 1:
+                arg.batch_size += arg.batch_size_add 
+                line = 0
+                data_processor.close() 
+                data_processor = None
+                epochs += 1 
+                epoch_sum = epochs
+                logging.info('Step: ' + str(step))
+                logging.info('Epochs: ' + str(epochs))
+                logging.info('Loss: ' + str(loss / num_loss))
+                num_loss = 0
+                loss = 0.0
+    
+                save_path = os.path.join(arg.model_path, '_step_' + str(step) + '_epochs_' + str(epochs) + '.ckpt')
+                saver.save(sess, save_path)
+    
+    
+                def valid(in_path, slot_path, intent_path):
+                    
+                    data_processor_valid = DataProcessor(in_path, slot_path, intent_path, in_vocab, slot_vocab,
+                                                         intent_vocab)
+                    pred_intents = []
+                    correct_intents = []
+                    slot_outputs = []
+                    correct_slots = []
+                    input_words = []
+                    
+    
+                    # used to gate
+                    gate_seq = []
+                    while True:
+                        in_data, slot_data, slot_weight, length, intents, in_seq, slot_seq, intent_seq = data_processor_valid.get_batch(
+                            arg.batch_size)
+                        if len(in_data) <= 0:
                             break
-                    index += 1
-                semantic_acc = semantic_acc.astype(float)
-                semantic_acc = np.mean(semantic_acc) * 100.0
-
-                f1, precision, recall = computeF1Score(correct_slots, slot_outputs)
-                logging.info('slot f1: ' + str(f1))
-                logging.info('intent accuracy: ' + str(accuracy))
-                logging.info('semantic Acc(intent, slots are all correct): ' + str(semantic_acc))
+                        feed_dict = {input_data.name: in_data, sequence_length.name: length}
+                        ret = sess.run(inference_outputs, feed_dict)
+                        for i in ret[0]:  
+                            pred_intents.append(np.argmax(i))
+                        for i in intents:
+                            correct_intents.append(i)
+    
+                        pred_slots = ret[1].reshape((slot_data.shape[0], slot_data.shape[1], -1))
+                        for p, t, i, l in zip(pred_slots, slot_data, in_data, length):
+                            if arg.use_crf:
+                                p = p.reshape([-1])
+                            else:
+                                p = np.argmax(p, 1)
+                            tmp_pred = []
+                            tmp_correct = []
+                            tmp_input = []
+                            for j in range(l):
+                                tmp_pred.append(slot_vocab['rev'][p[j]])
+                                tmp_correct.append(slot_vocab['rev'][t[j]])
+                                tmp_input.append(in_vocab['rev'][i[j]])
+    
+                            slot_outputs.append(tmp_pred)  
+                            correct_slots.append(tmp_correct)
+                            input_words.append(tmp_input)
+    
+                        if data_processor_valid.end == 1:
+                            break
+    
+                    pred_intents = np.array(pred_intents)
+                    correct_intents = np.array(correct_intents)
+                    accuracy = (pred_intents == correct_intents)
+                    semantic_acc = accuracy
+                    accuracy = accuracy.astype(float)
+                    accuracy = np.mean(accuracy) * 100.0  
+    
+                    index = 0
+                    for t, p in zip(correct_slots, slot_outputs):
+                        # Process Semantic Error
+                        if len(t) != len(p):
+                            raise ValueError('Error!!')
+    
+                        for j in range(len(t)):
+                            if p[j] != t[j]:
+                                semantic_acc[index] = False
+                                break
+                        index += 1
+                    semantic_acc = semantic_acc.astype(float)
+                    semantic_acc = np.mean(semantic_acc) * 100.0
+                        
+                    f1, precision, recall = computeF1Score(correct_slots, slot_outputs)
+                    logging.info('slot f1: ' + str(f1))
+                    logging.info('intent accuracy: ' + str(accuracy))
+                    logging.info('semantic Acc(intent, slots are all correct): ' + str(semantic_acc))
+    
+                    
+                    data_processor_valid.close()
+                    return f1, accuracy, semantic_acc, pred_intents, correct_intents, slot_outputs, correct_slots, input_words, gate_seq
+    
                 
-                data_processor_valid.close()
-                return f1, accuracy, semantic_acc, pred_intents, correct_intents, slot_outputs, correct_slots, input_words, gate_seq
-
-            
-            logging.info('Valid:')
-            epoch_valid_slot, epoch_valid_intent, epoch_valid_err, valid_pred_intent, valid_correct_intent, valid_pred_slot, valid_correct_slot, valid_words, valid_gate = valid(
-                os.path.join(full_valid_path, arg.input_file), os.path.join(full_valid_path, arg.slot_file),
-                os.path.join(full_valid_path, arg.intent_file))
-
-            logging.info('Test:')
-            epoch_test_slot, epoch_test_intent, epoch_test_err, test_pred_intent, test_correct_intent, test_pred_slot, test_correct_slot, test_words, test_gate = valid(
-                os.path.join(full_test_path, arg.input_file), os.path.join(full_test_path, arg.slot_file),
-                os.path.join(full_test_path, arg.intent_file))
-            
-            logging.info('epoch_valid_slot :  {}'.format(epoch_valid_slot))
-            logging.info('epoch_valid_intent : {}'.format(epoch_valid_intent))
-            logging.info('epoch_valid_err: {}'.format(epoch_valid_err))
-            logging.info('epoch_test_slot :  {}'.format(epoch_test_slot))
-            logging.info('epoch_test_intent : {}'.format(epoch_test_intent))
-            logging.info('epoch_test_err: {}'.format(epoch_test_err))
-            if epoch_test_err <= test_err:
-                no_improve += 1
-            else:
-                best_epoch_num = epochs
-                test_err = epoch_test_err
-
-                # logging.info('new best epoch number: Epoch Number: {}'.format(best_epoch_num))
-                # logging.info('new best score: Semantic Acc: {}'.format(epoch_test_err))
-                no_improve = 0
-
-            if test_err > 0:
-                logging.info('best epoch_num :  {}'.format(best_epoch_num))
-                logging.info('best score : {}'.format(test_err))
-            if epochs == arg.max_epochs:
-                break
-
-            if arg.early_stop == True:
-                if no_improve > arg.patience:
+                logging.info('Valid:')
+                epoch_valid_slot, epoch_valid_intent, epoch_valid_err, valid_pred_intent, valid_correct_intent, valid_pred_slot, valid_correct_slot, valid_words, valid_gate = valid(
+                    os.path.join(full_valid_path, arg.input_file), os.path.join(full_valid_path, arg.slot_file),
+                    os.path.join(full_valid_path, arg.intent_file))
+    
+    
+                logging.info('Test:')
+                epoch_test_slot, epoch_test_intent, epoch_test_err, test_pred_intent, test_correct_intent, test_pred_slot, test_correct_slot, test_words, test_gate = valid(
+                    os.path.join(full_test_path, arg.input_file), os.path.join(full_test_path, arg.slot_file),
+                    os.path.join(full_test_path, arg.intent_file))
+                #f1_result_array.append(epoch_test_slot)
+                #acc_result_array.append(epoch_test_intent)
+                #semantic_acc_array.append(epoch_test_err)
+                file_handle = open(full_test_path+filename, 'a')
+                series = str(epochs)+","+str(epoch_test_slot)+","+str(epoch_test_intent)+","+str(epoch_test_err)  # 每个元素都是字符串，使用逗号分割拼接成一个字符串
+                file_handle.write(series+'\n') # 末尾使用换行分割每一行。
+                file_handle.close()
+    #            logging.info('epoch_valid_slot :  {}'.format(epoch_valid_slot))
+    #            logging.info('epoch_valid_intent : {}'.format(epoch_valid_intent))
+    #            logging.info('epoch_valid_err: {}'.format(epoch_valid_err))
+    #            logging.info('epoch_test_slot :  {}'.format(epoch_test_slot))
+    #            logging.info('epoch_test_intent : {}'.format(epoch_test_intent))
+    #            logging.info('epoch_test_err: {}'.format(epoch_test_err))
+                if epoch_test_err <= test_err:
+                    no_improve += 1
+                else:
+                    best_epoch_num = epochs
+                    test_err = epoch_test_err
+    
+                    # logging.info('new best epoch number: Epoch Number: {}'.format(best_epoch_num))
+                    # logging.info('new best score: Semantic Acc: {}'.format(epoch_test_err))
+                    no_improve = 0
+    
+                if test_err > 0:
+                    logging.info('best epoch_num :  {}'.format(best_epoch_num))
+                    logging.info('best score : {}'.format(test_err))
+                if epochs == arg.max_epochs:
                     break
+    
+                if arg.early_stop == True:
+                    if no_improve > arg.patience:
+                        break
